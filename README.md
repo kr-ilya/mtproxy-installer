@@ -9,7 +9,9 @@
 ## Quick install
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/kr-ilya/mtproxy-installer/main/install.sh)
+curl -O https://raw.githubusercontent.com/kr-ilya/mtproxy-installer/main/install.sh
+chmod +x install.sh
+./install.sh
 ```
 
 ## Preview
