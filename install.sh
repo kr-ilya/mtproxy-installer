@@ -70,7 +70,9 @@ save_config() {
         cfg_set FAKE_TLS_DOMAIN "$FAKE_TLS_DOMAIN"
     fi
     if [[ "$PROXY_TYPE" == "telemt" ]]; then
-        cfg_set TELEMT_DOMAIN "$TELEMT_DOMAIN"
+        cfg_set TELEMT_DOMAIN        "$TELEMT_DOMAIN"
+        cfg_set TELEMT_METRICS       "$TELEMT_METRICS"
+        cfg_set TELEMT_METRICS_PORT  "$TELEMT_METRICS_PORT"
     fi
 }
 
@@ -84,6 +86,8 @@ load_config() {
     FAKE_TLS=$(cfg_get FAKE_TLS)
     FAKE_TLS_DOMAIN=$(cfg_get FAKE_TLS_DOMAIN)
     TELEMT_DOMAIN=$(cfg_get TELEMT_DOMAIN)
+    TELEMT_METRICS=$(cfg_get TELEMT_METRICS)
+    TELEMT_METRICS_PORT=$(cfg_get TELEMT_METRICS_PORT)
 }
 
 config_exists() { [[ -f "$CONFIG_FILE" ]]; }
@@ -199,7 +203,7 @@ users_list_names() {
 regen_telemt_toml() {
     local port="$1" domain="$2"
     mkdir -p "$TELEMT_CONFIG_DIR"
-    # Dir: root-owned, readable by root only (container started as root for <1024 ports)
+    # Dir: root-owned, readable by root only
     chmod 750 "$TELEMT_CONFIG_DIR"
     cat > "$TELEMT_TOML" <<TOML
 [general]
@@ -212,6 +216,14 @@ tls = true
 
 [server]
 port = ${port}
+TOML
+    if [[ "$TELEMT_METRICS" == "1" ]]; then
+        cat >> "$TELEMT_TOML" <<TOML
+metrics_port = ${TELEMT_METRICS_PORT}
+metrics_whitelist = ["127.0.0.1/32"]
+TOML
+    fi
+    cat >> "$TELEMT_TOML" <<TOML
 
 [server.api]
 listen = "127.0.0.1:${TELEMT_API_PORT}"
@@ -274,12 +286,17 @@ run_mtproxy() {
 }
 
 run_telemt() {
+    local extra_ports=()
+    if [[ "$TELEMT_METRICS" == "1" ]]; then
+        extra_ports+=(-p "127.0.0.1:${TELEMT_METRICS_PORT}:${TELEMT_METRICS_PORT}/tcp")
+    fi
     docker run -d \
         --name "${CONTAINER_NAME}" \
         --restart unless-stopped \
         --user root \
         -p "${PORT}:${PORT}/tcp" \
         -p "127.0.0.1:${TELEMT_API_PORT}:${TELEMT_API_PORT}/tcp" \
+        "${extra_ports[@]}" \
         -v "${TELEMT_CONFIG_DIR}:${TELEMT_CONFIG_DIR}" \
         -e RUST_LOG=info \
         "${IMAGE}" "${TELEMT_TOML}" > /dev/null
@@ -422,6 +439,27 @@ install_telemt() {
     read -rp "Domain [cloudflare.com]: " _in
     TELEMT_DOMAIN="${_in:-cloudflare.com}"
     ok "Domain: $TELEMT_DOMAIN"
+    println ""
+
+    # Metrics
+    println "${BOLD}Prometheus metrics${NC}"
+    println "Expose metrics on localhost for scraping (e.g. by Prometheus/Grafana)."
+    read -rp "Enable metrics? [y/N]: " _in
+    case "${_in,,}" in
+        y|yes)
+            TELEMT_METRICS=1
+            read -rp "Metrics port [9090]: " _in
+            TELEMT_METRICS_PORT="${_in:-9090}"
+            [[ "$TELEMT_METRICS_PORT" =~ ^[0-9]+$ ]] && (( TELEMT_METRICS_PORT >= 1 && TELEMT_METRICS_PORT <= 65535 )) \
+                || die "Invalid metrics port: $TELEMT_METRICS_PORT"
+            ok "Metrics: enabled (127.0.0.1:${TELEMT_METRICS_PORT})"
+            ;;
+        *)
+            TELEMT_METRICS=0
+            TELEMT_METRICS_PORT=""
+            ok "Metrics: disabled"
+            ;;
+    esac
     println ""
 
     # First user
@@ -644,6 +682,111 @@ action_remove_user() {
     println ""
 }
 
+action_reconfigure() {
+    println ""
+    if [[ "$PROXY_TYPE" == "mtproxy" ]]; then
+        # ── MTProxy reconfigure ───────────────────────────────────────────────
+        println "${BOLD}Port${NC} ${DIM}(current: ${PORT})${NC}"
+        read -rp "Port [${PORT}]: " _in
+        local new_port="${_in:-${PORT}}"
+        [[ "$new_port" =~ ^[0-9]+$ ]] && (( new_port >= 1 && new_port <= 65535 )) \
+            || { warn "Invalid port."; return; }
+
+        println ""
+        local fake_tls_default="N"; [[ "$FAKE_TLS" == "1" ]] && fake_tls_default="Y"
+        println "${BOLD}Fake TLS${NC} ${DIM}(current: $([ "$FAKE_TLS" == "1" ] && echo enabled || echo disabled))${NC}"
+        read -rp "Enable Fake TLS? [${fake_tls_default}]: " _in
+        local new_fake_tls new_domain new_secret
+        case "${_in,,}" in
+            n|no) new_fake_tls=0; new_domain="cloudflare.com" ;;
+            y|yes|"")
+                if [[ "$fake_tls_default" == "N" && -z "$_in" ]]; then
+                    new_fake_tls=0; new_domain="cloudflare.com"
+                else
+                    new_fake_tls=1
+                    println ""
+                    println "${BOLD}Fake TLS domain${NC} ${DIM}(current: ${FAKE_TLS_DOMAIN})${NC}"
+                    read -rp "Domain [${FAKE_TLS_DOMAIN}]: " _in
+                    new_domain="${_in:-${FAKE_TLS_DOMAIN}}"
+                fi
+                ;;
+            *) new_fake_tls=0; new_domain="cloudflare.com" ;;
+        esac
+
+        println ""
+        read -rp "Regenerate secret? (links will change) [y/N]: " _in
+        case "${_in,,}" in
+            y|yes)
+                if [[ "$new_fake_tls" == "1" ]]; then
+                    new_secret=$(gen_fake_tls_secret "$new_domain")
+                else
+                    new_secret=$(gen_hex16)
+                fi
+                ok "New secret generated."
+                ;;
+            *) new_secret="$SECRET"; ok "Keeping current secret." ;;
+        esac
+
+        PORT="$new_port"; FAKE_TLS="$new_fake_tls"
+        FAKE_TLS_DOMAIN="$new_domain"; SECRET="$new_secret"
+        save_config
+        info "Restarting container..."
+        stop_and_remove "$CONTAINER_NAME"
+        run_mtproxy
+        verify_container "$CONTAINER_NAME"
+        header "Connection Links"
+        print_mtproxy_links
+
+    else
+        # ── Telemt reconfigure ────────────────────────────────────────────────
+        println "${BOLD}Port${NC} ${DIM}(current: ${PORT})${NC}"
+        read -rp "Port [${PORT}]: " _in
+        local new_port="${_in:-${PORT}}"
+        [[ "$new_port" =~ ^[0-9]+$ ]] && (( new_port >= 1 && new_port <= 65535 )) \
+            || { warn "Invalid port."; return; }
+
+        println ""
+        println "${BOLD}Fake TLS domain${NC} ${DIM}(current: ${TELEMT_DOMAIN})${NC}"
+        read -rp "Domain [${TELEMT_DOMAIN}]: " _in
+        local new_domain="${_in:-${TELEMT_DOMAIN}}"
+
+        println ""
+        local metrics_cur="disabled"; [[ "$TELEMT_METRICS" == "1" ]] && metrics_cur="enabled on port ${TELEMT_METRICS_PORT}"
+        local metrics_default="N"; [[ "$TELEMT_METRICS" == "1" ]] && metrics_default="Y"
+        println "${BOLD}Prometheus metrics${NC} ${DIM}(current: ${metrics_cur})${NC}"
+        read -rp "Enable metrics? [${metrics_default}]: " _in
+        local new_metrics new_metrics_port
+        case "${_in,,}" in
+            n|no) new_metrics=0; new_metrics_port="" ;;
+            y|yes|"")
+                if [[ "$metrics_default" == "N" && -z "$_in" ]]; then
+                    new_metrics=0; new_metrics_port=""
+                else
+                    new_metrics=1
+                    local mp_default="${TELEMT_METRICS_PORT:-9090}"
+                    read -rp "Metrics port [${mp_default}]: " _in
+                    new_metrics_port="${_in:-${mp_default}}"
+                    [[ "$new_metrics_port" =~ ^[0-9]+$ ]] && (( new_metrics_port >= 1 && new_metrics_port <= 65535 )) \
+                        || { warn "Invalid metrics port."; return; }
+                fi
+                ;;
+            *) new_metrics=0; new_metrics_port="" ;;
+        esac
+
+        PORT="$new_port"; TELEMT_DOMAIN="$new_domain"
+        TELEMT_METRICS="$new_metrics"; TELEMT_METRICS_PORT="$new_metrics_port"
+        save_config
+        regen_telemt_toml "$PORT" "$TELEMT_DOMAIN"
+        info "Restarting container..."
+        stop_and_remove "$CONTAINER_NAME"
+        run_telemt
+        verify_container "$CONTAINER_NAME"
+        header "Connection Links"
+        print_telemt_links
+    fi
+    println ""
+}
+
 # ── Menus ─────────────────────────────────────────────────────────────────────
 menu_users() {
     while true; do
@@ -667,10 +810,19 @@ menu_users() {
 menu_manage() {
     load_config
     while true; do
-        local st
+        local st info_line
         st=$(status_icon "$CONTAINER_NAME")
+        info_line="${PROXY_TYPE}  |  port ${PORT}"
+        if [[ "$PROXY_TYPE" == "telemt" ]]; then
+            if [[ "$TELEMT_METRICS" == "1" ]]; then
+                info_line+="  |  metrics 127.0.0.1:${TELEMT_METRICS_PORT}"
+            else
+                info_line+="  |  ${DIM}metrics off${NC}"
+            fi
+        fi
+        info_line+="  |  $(echo -e "$st")"
         header "MTProxy Manager"
-        println "- ${PROXY_TYPE}  |  port ${PORT}  |  $(echo -e "$st")"
+        println "  ${info_line}"
         println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         println "  1) Show connection links"
         println "  2) View logs"
@@ -678,9 +830,10 @@ menu_manage() {
         if [[ "$PROXY_TYPE" == "telemt" ]]; then
             println "  4) Manage users"
         fi
-        println "  5) Restart"
-        println "  6) Reinstall / reconfigure"
-        println "  7) Uninstall"
+        println "  5) Reconfigure  ${DIM}(change settings, keep users & secrets)${NC}"
+        println "  6) Restart"
+        println "  7) Reinstall    ${DIM}(full reset)${NC}"
+        println "  8) Uninstall"
         println "  q) Quit"
         println ""
         read -rp "Choice: " choice
@@ -699,24 +852,25 @@ menu_manage() {
                 if [[ "$PROXY_TYPE" == "telemt" ]]; then
                     menu_users
                 else
-                    warn "User management is only available for Telemt."
+                    warn "Unknown option."
                 fi
                 ;;
-            5) action_restart ;;
-            6)
-                warn "This will stop the current container and reinstall."
+            5) action_reconfigure ;;
+            6) action_restart ;;
+            7)
+                warn "This will stop the container, wipe config and reinstall from scratch."
                 read -rp "Continue? [y/N]: " _in
                 case "${_in,,}" in
                     y|yes)
                         stop_and_remove "$CONTAINER_NAME"
-                        rm -f "$CONFIG_FILE"
+                        rm -f "$CONFIG_FILE" "$TELEMT_USERS_FILE"
                         menu_install
                         return
                         ;;
                     *) ;;
                 esac
                 ;;
-            7) action_uninstall ;;
+            8) action_uninstall ;;
             q|Q) exit 0 ;;
             *) warn "Unknown option." ;;
         esac
