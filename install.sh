@@ -274,18 +274,13 @@ run_mtproxy() {
 }
 
 run_telemt() {
-    # Port <1024 requires root inside the container.
-    local extra_args=()
-    if (( PORT < 1024 )); then
-        extra_args+=(--user root)
-    fi
     docker run -d \
         --name "${CONTAINER_NAME}" \
         --restart unless-stopped \
-        "${extra_args[@]}" \
+        --user root \
         -p "${PORT}:${PORT}/tcp" \
         -p "127.0.0.1:${TELEMT_API_PORT}:${TELEMT_API_PORT}/tcp" \
-        -v "${TELEMT_CONFIG_DIR}:${TELEMT_CONFIG_DIR}:ro" \
+        -v "${TELEMT_CONFIG_DIR}:${TELEMT_CONFIG_DIR}" \
         -e RUST_LOG=info \
         "${IMAGE}" "${TELEMT_TOML}" > /dev/null
 }
