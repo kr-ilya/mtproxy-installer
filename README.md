@@ -12,6 +12,17 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/kr-ilya/mtproxy-installer/main/install.sh)
 ```
 
+## Preview
+
+Startup menu  
+
+<img width="428" height="130" alt="hello" src="https://github.com/user-attachments/assets/6c6dbefe-ab20-4a9a-8551-bd2eece7d8b6" />
+
+Manage menu  
+
+<img width="261" height="172" alt="manage" src="https://github.com/user-attachments/assets/b0e6386b-bd3c-4b5f-870e-734178fbd475" />
+
+
 ## References
 
 - [Official MTProxy](https://github.com/TelegramMessenger/MTProxy) — original Telegram MTProxy server
