@@ -286,6 +286,9 @@ run_mtproxy() {
         -e FAKE_TLS="${FAKE_TLS}" \
         -e FAKE_TLS_DOMAIN="${FAKE_TLS_DOMAIN}" \
         -v mtproxy-data:/data \
+        --log-driver json-file \
+        --log-opt max-size=15m \
+        --log-opt max-file=3 \
         "${IMAGE}" > /dev/null
 }
 
@@ -303,6 +306,9 @@ run_telemt() {
         "${extra_ports[@]}" \
         -v "${TELEMT_CONFIG_DIR}:${TELEMT_CONFIG_DIR}" \
         -e RUST_LOG=info \
+        --log-driver json-file \
+        --log-opt max-size=15m \
+        --log-opt max-file=3 \
         "${IMAGE}" "${TELEMT_TOML}" > /dev/null
 }
 
