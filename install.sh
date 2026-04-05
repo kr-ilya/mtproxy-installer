@@ -28,9 +28,9 @@ CONFIG_FILE="$CONFIG_DIR/config"          # plain key=value, never sourced
 TELEMT_USERS_FILE="$CONFIG_DIR/telemt-users"  # name=secret, one per line
 TELEMT_CONFIG_DIR="/etc/telemt"
 TELEMT_TOML="$TELEMT_CONFIG_DIR/telemt.toml"
-TELEMT_API="http://127.0.0.1:9091"
 STATS_PORT=8888
-TELEMT_API_PORT=9091
+TELEMT_API_PORT=9091          # default; may be overridden by config or user input
+TELEMT_API="http://127.0.0.1:${TELEMT_API_PORT}"
 
 # ── Plain key=value config ────────────────────────────────────────────────────
 # No shell syntax — values stored and read literally.
@@ -71,6 +71,7 @@ save_config() {
     fi
     if [[ "$PROXY_TYPE" == "telemt" ]]; then
         cfg_set TELEMT_DOMAIN        "$TELEMT_DOMAIN"
+        cfg_set TELEMT_API_PORT      "$TELEMT_API_PORT"
         cfg_set TELEMT_METRICS       "$TELEMT_METRICS"
         cfg_set TELEMT_METRICS_PORT  "$TELEMT_METRICS_PORT"
     fi
@@ -86,8 +87,11 @@ load_config() {
     FAKE_TLS=$(cfg_get FAKE_TLS)
     FAKE_TLS_DOMAIN=$(cfg_get FAKE_TLS_DOMAIN)
     TELEMT_DOMAIN=$(cfg_get TELEMT_DOMAIN)
+    TELEMT_API_PORT=$(cfg_get TELEMT_API_PORT)
     TELEMT_METRICS=$(cfg_get TELEMT_METRICS)
     TELEMT_METRICS_PORT=$(cfg_get TELEMT_METRICS_PORT)
+    # Recompute derived value
+    TELEMT_API="http://127.0.0.1:${TELEMT_API_PORT}"
 }
 
 config_exists() { [[ -f "$CONFIG_FILE" ]]; }
@@ -431,6 +435,21 @@ install_telemt() {
     PORT="${_in:-443}"
     [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "Invalid port: $PORT"
     ok "Port: $PORT"
+    println ""
+
+    # API port
+    if ! ss -tlnH "sport = :9091" 2>/dev/null | grep -q .; then
+        TELEMT_API_PORT=9091
+        ok "API port: 9091"
+    else
+        warn "Port 9091 is already in use."
+        read -rp "API port [19091]: " _in
+        TELEMT_API_PORT="${_in:-19091}"
+        [[ "$TELEMT_API_PORT" =~ ^[0-9]+$ ]] && (( TELEMT_API_PORT >= 1 && TELEMT_API_PORT <= 65535 )) \
+            || die "Invalid API port: $TELEMT_API_PORT"
+        ok "API port: $TELEMT_API_PORT"
+    fi
+    TELEMT_API="http://127.0.0.1:${TELEMT_API_PORT}"
     println ""
 
     # TLS domain
