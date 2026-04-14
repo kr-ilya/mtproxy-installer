@@ -88,6 +88,7 @@ load_config() {
     FAKE_TLS_DOMAIN=$(cfg_get FAKE_TLS_DOMAIN)
     TELEMT_DOMAIN=$(cfg_get TELEMT_DOMAIN)
     TELEMT_API_PORT=$(cfg_get TELEMT_API_PORT)
+    TELEMT_API_PORT="${TELEMT_API_PORT:-9091}"
     TELEMT_METRICS=$(cfg_get TELEMT_METRICS)
     TELEMT_METRICS_PORT=$(cfg_get TELEMT_METRICS_PORT)
     # Recompute derived value
@@ -224,13 +225,14 @@ TOML
     if [[ "$TELEMT_METRICS" == "1" ]]; then
         cat >> "$TELEMT_TOML" <<TOML
 metrics_port = ${TELEMT_METRICS_PORT}
-metrics_whitelist = ["127.0.0.1/32"]
+metrics_whitelist = ["0.0.0.0/0"]
 TOML
     fi
     cat >> "$TELEMT_TOML" <<TOML
 
 [server.api]
-listen = "127.0.0.1:${TELEMT_API_PORT}"
+listen = "0.0.0.0:${TELEMT_API_PORT}"
+whitelist = []
 
 [censorship]
 tls_domain = "${domain}"
@@ -238,9 +240,9 @@ tls_domain = "${domain}"
 [access.users]
 TOML
     if users_file_exists; then
-        while IFS='=' read -r name secret; do
-            [[ -z "$name" || -z "$secret" ]] && continue
-            echo "${name} = \"${secret}\"" >> "$TELEMT_TOML"
+        while IFS='=' read -r _n _s; do
+            [[ -z "$_n" || -z "$_s" ]] && continue
+            echo "${_n} = \"${_s}\"" >> "$TELEMT_TOML"
         done < "$TELEMT_USERS_FILE"
     fi
     chmod 640 "$TELEMT_TOML"
@@ -337,9 +339,9 @@ print_telemt_links() {
         warn "No users configured."
         return
     fi
-    while IFS='=' read -r name secret; do
-        [[ -z "$name" || -z "$secret" ]] && continue
-        print_user_links "$name" "$secret"
+    while IFS='=' read -r _n _s; do
+        [[ -z "$_n" || -z "$_s" ]] && continue
+        print_user_links "$_n" "$_s"
     done < "$TELEMT_USERS_FILE"
 }
 
@@ -605,15 +607,16 @@ action_list_users() {
     println ""
     println "  ${BOLD}Users${NC}"
     sep
-    while IFS='=' read -r name secret; do
-        [[ -z "$name" || -z "$secret" ]] && continue
-        println "  Secret: ${DIM}${secret}${NC}"
-        print_user_links "$name" "$secret"
+    while IFS='=' read -r _n _s; do
+        [[ -z "$_n" || -z "$_s" ]] && continue
+        println "  Secret: ${DIM}${_s}${NC}"
+        print_user_links "$_n" "$_s"
     done < "$TELEMT_USERS_FILE"
 }
 
 action_add_user() {
     println ""
+    local name
     read -rp "Username: " name
     [[ -z "$name" ]] && warn "Name cannot be empty." && return
     # Restrict to safe characters to prevent TOML injection
@@ -639,23 +642,30 @@ action_add_user() {
         secret="$secret_in"
     fi
 
-    users_add "$name" "$secret"
-    regen_telemt_toml "$PORT" "$TELEMT_DOMAIN"
-
-    # Hot-reload via API (no restart needed if API accepts it)
+    # Try API first — telemt watches TOML via inotify, so writing the file
+    # before the API call would make the user already exist in runtime.
     if container_running "$CONTAINER_NAME"; then
         local api_resp
-        api_resp=$(curl -sf -X POST "${TELEMT_API}/v1/users" \
+        api_resp=$(curl -s -X POST "${TELEMT_API}/v1/users" \
             -H "Content-Type: application/json" \
             -d "{\"username\":\"${name}\",\"secret\":\"${secret}\"}" 2>/dev/null || echo "")
         if echo "$api_resp" | grep -q '"ok":true'; then
-            ok "User '${name}' added via API (no restart needed)."
+            # API succeeded: persist to files so the user survives a restart
+            users_add "$name" "$secret"
+            regen_telemt_toml "$PORT" "$TELEMT_DOMAIN"
+            ok "User '${name}' added via API."
         else
-            info "API unavailable — restarting container..."
+            # API failed: write files and restart — inotify will pick up the change
+            users_add "$name" "$secret"
+            regen_telemt_toml "$PORT" "$TELEMT_DOMAIN"
+            info "Restarting container..."
             docker restart "$CONTAINER_NAME" > /dev/null
             sleep 1
             ok "User '${name}' added (container restarted)."
         fi
+    else
+        users_add "$name" "$secret"
+        regen_telemt_toml "$PORT" "$TELEMT_DOMAIN"
     fi
 
     println ""
@@ -675,6 +685,7 @@ action_remove_user() {
     done < "$TELEMT_USERS_FILE"
     println ""
 
+    local name
     read -rp "Username to remove: " name
     [[ -z "$name" ]] && return
 
@@ -688,21 +699,26 @@ action_remove_user() {
         return
     fi
 
-    users_remove "$name"
-    regen_telemt_toml "$PORT" "$TELEMT_DOMAIN"
-
-    # Hot-reload via API
+    # Try API first for the same reason as add: inotify would remove the user
+    # from runtime as soon as we write the TOML, causing a DELETE conflict.
     if container_running "$CONTAINER_NAME"; then
         local api_resp
-        api_resp=$(curl -sf -X DELETE "${TELEMT_API}/v1/users/${name}" 2>/dev/null || echo "")
+        api_resp=$(curl -s -X DELETE "${TELEMT_API}/v1/users/${name}" 2>/dev/null || echo "")
         if echo "$api_resp" | grep -q '"ok":true'; then
+            users_remove "$name"
+            regen_telemt_toml "$PORT" "$TELEMT_DOMAIN"
             ok "User '${name}' removed via API."
         else
-            info "API unavailable — restarting container..."
+            users_remove "$name"
+            regen_telemt_toml "$PORT" "$TELEMT_DOMAIN"
+            info "Restarting container..."
             docker restart "$CONTAINER_NAME" > /dev/null
             sleep 1
             ok "User '${name}' removed (container restarted)."
         fi
+    else
+        users_remove "$name"
+        regen_telemt_toml "$PORT" "$TELEMT_DOMAIN"
     fi
     println ""
 }
