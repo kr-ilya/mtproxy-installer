@@ -1,10 +1,13 @@
 # MTProxy Installer
 
 - Install **Official MTProxy** (imilya/mtproxy) or **Telemt** (Rust-based, high performance) in Docker
+- **Side by side** — both proxies can be installed at the same time on different ports, each managed independently
 - **Fake TLS** — disguise traffic as HTTPS to bypass DPI and censorship
+- Server address is detected automatically but can be overridden — e.g. `127.0.0.1` for a local install (the proxy port is then published on loopback only), or a domain name
 - **Multi-user support** in Telemt with hot add/remove via API (no restart needed)
+- MTProxy links in all three formats: EE (Fake TLS), DD (secure) and **plain** (bare secret, no obfuscation)
 - Management menu: view links, logs, update image, restart, uninstall
-- Re-running the script opens the management menu for an already installed proxy
+- Re-running the script opens the proxy list: pick an installed proxy to manage it, or a free slot to install it
 
 ## Quick install
 

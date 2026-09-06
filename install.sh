@@ -24,13 +24,84 @@ TELEMT_IMAGE="whn0thacked/telemt-docker:latest"
 MTPROXY_CONTAINER="mtproxy"
 TELEMT_CONTAINER="telemt"
 CONFIG_DIR="/etc/mtproxy-installer"
-CONFIG_FILE="$CONFIG_DIR/config"          # plain key=value, never sourced
+LEGACY_CONFIG_FILE="$CONFIG_DIR/config"   # pre-multi-instance layout
+CONFIG_FILE=""                            # set by use_instance(); plain key=value, never sourced
 TELEMT_USERS_FILE="$CONFIG_DIR/telemt-users"  # name=secret, one per line
 TELEMT_CONFIG_DIR="/etc/telemt"
 TELEMT_TOML="$TELEMT_CONFIG_DIR/telemt.toml"
-STATS_PORT=8888
+STATS_PORT=8888               # container-side stats port; host side is optional
 TELEMT_API_PORT=9091          # default; may be overridden by config or user input
 TELEMT_API="http://127.0.0.1:${TELEMT_API_PORT}"
+
+# ── Instances ─────────────────────────────────────────────────────────────────
+# Two independent slots: one "mtproxy" and one "telemt", each with its own
+# config file and container. They can run side by side on different ports.
+
+INSTANCE_TYPES=(mtproxy telemt)
+
+config_file_for() {
+    # config_file_for TYPE → path of that instance's config
+    echo "${CONFIG_DIR}/config.$1"
+}
+
+container_for() {
+    [[ "$1" == "mtproxy" ]] && echo "$MTPROXY_CONTAINER" || echo "$TELEMT_CONTAINER"
+}
+
+image_for() {
+    [[ "$1" == "mtproxy" ]] && echo "$MTPROXY_IMAGE" || echo "$TELEMT_IMAGE"
+}
+
+type_label() {
+    [[ "$1" == "mtproxy" ]] && echo "Official MTProxy" || echo "Telemt"
+}
+
+other_type() {
+    [[ "$1" == "mtproxy" ]] && echo "telemt" || echo "mtproxy"
+}
+
+instance_installed() { [[ -f "$(config_file_for "$1")" ]]; }
+
+any_instance_installed() {
+    local t
+    for t in "${INSTANCE_TYPES[@]}"; do
+        instance_installed "$t" && return 0
+    done
+    return 1
+}
+
+# Point the config helpers at one instance. Must be called before
+# load_config/save_config and before any action touching a container.
+use_instance() {
+    PROXY_TYPE="$1"
+    CONFIG_FILE=$(config_file_for "$PROXY_TYPE")
+    CONTAINER_NAME=$(container_for "$PROXY_TYPE")
+    IMAGE=$(image_for "$PROXY_TYPE")
+}
+
+# Read a single key straight out of another instance's config file.
+peek_cfg() {
+    # peek_cfg TYPE KEY
+    local line
+    line=$(grep -m1 "^${2}=" "$(config_file_for "$1")" 2>/dev/null || true)
+    echo "${line#*=}"
+}
+
+# One-time migration from the old single-instance layout.
+migrate_legacy_config() {
+    [[ -f "$LEGACY_CONFIG_FILE" ]] || return 0
+    local t target
+    t=$(grep -m1 '^PROXY_TYPE=' "$LEGACY_CONFIG_FILE" 2>/dev/null | cut -d= -f2-)
+    [[ "$t" == "telemt" ]] || t="mtproxy"
+    target=$(config_file_for "$t")
+    if [[ -f "$target" ]]; then
+        rm -f "$LEGACY_CONFIG_FILE"
+    else
+        mv "$LEGACY_CONFIG_FILE" "$target"
+        chmod 600 "$target"
+    fi
+    println "${DIM}Migrated existing ${t} config to ${target}${NC}"
+}
 
 # ── Plain key=value config ────────────────────────────────────────────────────
 # No shell syntax — values stored and read literally.
@@ -55,6 +126,7 @@ cfg_set() {
 }
 
 save_config() {
+    [[ -n "$CONFIG_FILE" ]] || die "Internal error: no instance selected."
     mkdir -p "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
     : > "$CONFIG_FILE"
@@ -65,9 +137,11 @@ save_config() {
     cfg_set IMAGE         "$IMAGE"
     cfg_set CONTAINER_NAME "$CONTAINER_NAME"
     if [[ "$PROXY_TYPE" == "mtproxy" ]]; then
-        cfg_set SECRET          "$SECRET"
-        cfg_set FAKE_TLS        "$FAKE_TLS"
-        cfg_set FAKE_TLS_DOMAIN "$FAKE_TLS_DOMAIN"
+        cfg_set SECRET             "$SECRET"
+        cfg_set FAKE_TLS           "$FAKE_TLS"
+        cfg_set FAKE_TLS_DOMAIN    "$FAKE_TLS_DOMAIN"
+        cfg_set MTPROXY_STATS      "$MTPROXY_STATS"
+        cfg_set MTPROXY_STATS_PORT "$MTPROXY_STATS_PORT"
     fi
     if [[ "$PROXY_TYPE" == "telemt" ]]; then
         cfg_set TELEMT_DOMAIN        "$TELEMT_DOMAIN"
@@ -78,7 +152,10 @@ save_config() {
 }
 
 load_config() {
+    # Called after use_instance(); PROXY_TYPE is the fallback if the file lacks it.
+    local fallback_type="$PROXY_TYPE"
     PROXY_TYPE=$(cfg_get PROXY_TYPE)
+    [[ -n "$PROXY_TYPE" ]] || PROXY_TYPE="$fallback_type"
     PORT=$(cfg_get PORT)
     EXTERNAL_IP=$(cfg_get EXTERNAL_IP)
     IMAGE=$(cfg_get IMAGE)
@@ -86,16 +163,21 @@ load_config() {
     SECRET=$(cfg_get SECRET)
     FAKE_TLS=$(cfg_get FAKE_TLS)
     FAKE_TLS_DOMAIN=$(cfg_get FAKE_TLS_DOMAIN)
+    MTPROXY_STATS=$(cfg_get MTPROXY_STATS)
+    MTPROXY_STATS_PORT=$(cfg_get MTPROXY_STATS_PORT)
     TELEMT_DOMAIN=$(cfg_get TELEMT_DOMAIN)
     TELEMT_API_PORT=$(cfg_get TELEMT_API_PORT)
     TELEMT_API_PORT="${TELEMT_API_PORT:-9091}"
     TELEMT_METRICS=$(cfg_get TELEMT_METRICS)
     TELEMT_METRICS_PORT=$(cfg_get TELEMT_METRICS_PORT)
-    # Recompute derived value
+    # Recompute derived values / repair configs written by older versions
     TELEMT_API="http://127.0.0.1:${TELEMT_API_PORT}"
+    # Configs written before the stats port became optional always published it.
+    [[ "$PROXY_TYPE" == "mtproxy" && -z "$MTPROXY_STATS" ]] && MTPROXY_STATS=1
+    MTPROXY_STATS_PORT="${MTPROXY_STATS_PORT:-$STATS_PORT}"
+    [[ -n "$CONTAINER_NAME" ]] || CONTAINER_NAME=$(container_for "$PROXY_TYPE")
+    [[ -n "$IMAGE" ]]          || IMAGE=$(image_for "$PROXY_TYPE")
 }
-
-config_exists() { [[ -f "$CONFIG_FILE" ]]; }
 
 # ── Secret generation ─────────────────────────────────────────────────────────
 gen_hex16() {
@@ -111,6 +193,46 @@ gen_fake_tls_secret() {
     echo "ee${key}${domain_hex}"
 }
 
+# Raw 16-byte key of an MTProxy secret, with any ee/dd prefix and the
+# appended domain stripped. This is the "plain" (unobfuscated) secret.
+mtproxy_base_secret() {
+    local s="$1"
+    case "$s" in
+        ee*|dd*) echo "${s:2:32}" ;;
+        *)       echo "${s:0:32}" ;;
+    esac
+}
+
+# ── Port helpers ──────────────────────────────────────────────────────────────
+port_used_by_other_instance() {
+    # port_used_by_other_instance PORT SELF_TYPE
+    local port="$1" other other_port
+    other=$(other_type "$2")
+    instance_installed "$other" || return 1
+    other_port=$(peek_cfg "$other" PORT)
+    [[ -n "$other_port" && "$other_port" == "$port" ]]
+}
+
+# Prompt until a valid, non-conflicting port is entered. Sets PORT.
+read_port() {
+    # read_port SELF_TYPE DEFAULT
+    local self="$1" default="$2" p
+    while true; do
+        read -rp "Port [${default}]: " _in
+        p="${_in:-$default}"
+        if ! [[ "$p" =~ ^[0-9]+$ ]] || (( p < 1 || p > 65535 )); then
+            warn "Invalid port: $p"
+            continue
+        fi
+        if port_used_by_other_instance "$p" "$self"; then
+            warn "Port ${p} is already used by the $(other_type "$self") instance. Pick another one."
+            continue
+        fi
+        PORT="$p"
+        return
+    done
+}
+
 # ── External IP detection ─────────────────────────────────────────────────────
 detect_ip() {
     local ip=""
@@ -119,6 +241,53 @@ detect_ip() {
         [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$ip" && return
     done
     echo ""
+}
+
+valid_ipv4() {
+    local ip="$1" a b c d o
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r a b c d <<< "$ip"
+    for o in "$a" "$b" "$c" "$d"; do
+        (( 10#$o <= 255 )) || return 1
+    done
+    return 0
+}
+
+valid_host() {
+    valid_ipv4 "$1" && return 0
+    # Not a valid IPv4 — only a hostname is left, so it must contain a letter.
+    # (Otherwise "256.1.1.1" or "1.2.3" would sneak through as a "hostname".)
+    [[ "$1" =~ [a-zA-Z] ]] || return 1
+    # Letters, digits, dots and hyphens; must start and end alphanumeric.
+    [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]
+}
+
+# Detect the external IP, then let the user confirm or override it —
+# e.g. 127.0.0.1 for a local test install, or a domain name. Sets EXTERNAL_IP.
+read_external_ip() {
+    local current="${1:-}" detected=""
+    if [[ -z "$current" ]]; then
+        info "Detecting external IP..."
+        detected=$(detect_ip)
+        if [[ -n "$detected" ]]; then
+            ok "Detected: ${detected}"
+        else
+            warn "Could not detect the external IP automatically — enter it manually."
+        fi
+    fi
+    local default="${current:-${detected:-127.0.0.1}}"
+    println "${DIM}Used in connection links. Enter 127.0.0.1 for a local install${NC}"
+    println "${DIM}— the port is then published on loopback only.${NC}"
+    while true; do
+        read -rp "Server address [${default}]: " _in
+        local host="${_in:-$default}"
+        if valid_host "$host"; then
+            EXTERNAL_IP="$host"
+            ok "Server address: $EXTERNAL_IP"
+            return
+        fi
+        warn "Invalid address: ${host}"
+    done
 }
 
 # ── Container helpers ─────────────────────────────────────────────────────────
@@ -274,13 +443,30 @@ print_user_links() {
 }
 
 # ── Docker run helpers ────────────────────────────────────────────────────────
+# A local install (127.x.x.x / localhost) is only reachable from this machine,
+# so the proxy port is published on the loopback interface instead of 0.0.0.0.
+is_local_install() {
+    [[ "$EXTERNAL_IP" == "localhost" || "$EXTERNAL_IP" =~ ^127\. ]]
+}
+
+publish_addr() {
+    if is_local_install; then echo "127.0.0.1:"; else echo ""; fi
+}
+
 run_mtproxy() {
+    local bind stats_ports=()
+    bind=$(publish_addr)
+    # The stats endpoint lives inside the container either way; publishing it
+    # on the host is opt-in so it does not occupy a port for nothing.
+    if [[ "$MTPROXY_STATS" == "1" ]]; then
+        stats_ports+=(-p "127.0.0.1:${MTPROXY_STATS_PORT}:${STATS_PORT}/tcp")
+    fi
     docker run -d \
         --name "${CONTAINER_NAME}" \
         --restart unless-stopped \
-        -p "${PORT}:${PORT}/tcp" \
-        -p "${PORT}:${PORT}/udp" \
-        -p "127.0.0.1:${STATS_PORT}:${STATS_PORT}/tcp" \
+        -p "${bind}${PORT}:${PORT}/tcp" \
+        -p "${bind}${PORT}:${PORT}/udp" \
+        "${stats_ports[@]}" \
         -e PORT="${PORT}" \
         -e STATS_PORT="${STATS_PORT}" \
         -e SECRET="${SECRET}" \
@@ -295,7 +481,8 @@ run_mtproxy() {
 }
 
 run_telemt() {
-    local extra_ports=()
+    local extra_ports=() bind
+    bind=$(publish_addr)
     if [[ "$TELEMT_METRICS" == "1" ]]; then
         extra_ports+=(-p "127.0.0.1:${TELEMT_METRICS_PORT}:${TELEMT_METRICS_PORT}/tcp")
     fi
@@ -303,7 +490,7 @@ run_telemt() {
         --name "${CONTAINER_NAME}" \
         --restart unless-stopped \
         --user root \
-        -p "${PORT}:${PORT}/tcp" \
+        -p "${bind}${PORT}:${PORT}/tcp" \
         -p "127.0.0.1:${TELEMT_API_PORT}:${TELEMT_API_PORT}/tcp" \
         "${extra_ports[@]}" \
         -v "${TELEMT_CONFIG_DIR}:${TELEMT_CONFIG_DIR}" \
@@ -315,25 +502,34 @@ run_telemt() {
 }
 
 # ── Link display ──────────────────────────────────────────────────────────────
+print_local_bind_note() {
+    is_local_install || return 0
+    println "  ${DIM}Local install: port ${PORT} is published on 127.0.0.1 only,${NC}"
+    println "  ${DIM}not reachable from outside this machine.${NC}"
+}
+
 print_mtproxy_links() {
     println ""
     println "  ${BOLD}Server:${NC}  ${EXTERNAL_IP}:${PORT}"
     [[ "$FAKE_TLS" == "1" ]] && println "  ${BOLD}Domain:${NC}  ${FAKE_TLS_DOMAIN}"
+    print_local_bind_note
     println ""
-    local link
+    local base
+    base=$(mtproxy_base_secret "$SECRET")
+    println "  ${BOLD}Connection links:${NC}"
     if [[ "$FAKE_TLS" == "1" ]]; then
-        link="tg://proxy?server=${EXTERNAL_IP}&port=${PORT}&secret=${SECRET}"
-    else
-        link="tg://proxy?server=${EXTERNAL_IP}&port=${PORT}&secret=dd${SECRET}"
+        println "  ${DIM}EE (Fake TLS):${NC} ${GREEN}tg://proxy?server=${EXTERNAL_IP}&port=${PORT}&secret=${SECRET}${NC}"
     fi
-    println "  ${BOLD}Connection link:${NC}"
-    println "  ${GREEN}${link}${NC}"
+    println "  ${DIM}DD (Secure):${NC}   ${GREEN}tg://proxy?server=${EXTERNAL_IP}&port=${PORT}&secret=dd${base}${NC}"
+    println "  ${DIM}Plain (no obfuscation):${NC}"
+    println "  ${GREEN}tg://proxy?server=${EXTERNAL_IP}&port=${PORT}&secret=${base}${NC}"
     println ""
 }
 
 print_telemt_links() {
     println ""
     println "  ${BOLD}Server:${NC}  ${EXTERNAL_IP}:${PORT}  (domain: ${TELEMT_DOMAIN})"
+    print_local_bind_note
     println ""
     if ! users_file_exists || [[ "$(users_count)" -eq 0 ]]; then
         warn "No users configured."
@@ -350,11 +546,13 @@ print_telemt_links() {
 # ══════════════════════════════════════════════════════════════════════════════
 
 install_mtproxy() {
-    PROXY_TYPE="mtproxy"
-    IMAGE="$MTPROXY_IMAGE"
-    CONTAINER_NAME="$MTPROXY_CONTAINER"
+    use_instance mtproxy
 
     println ""
+    if instance_installed telemt; then
+        info "Telemt is already installed on port $(peek_cfg telemt PORT) — MTProxy will run alongside it."
+        println ""
+    fi
 
     # PID limit
     local current_pid_max
@@ -374,9 +572,9 @@ install_mtproxy() {
 
     # Port
     println "${BOLD}Port${NC}"
-    read -rp "Port [443]: " _in
-    PORT="${_in:-443}"
-    [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "Invalid port: $PORT"
+    local default_port=443
+    port_used_by_other_instance 443 mtproxy && default_port=8443
+    read_port mtproxy "$default_port"
     ok "Port: $PORT"
     println ""
 
@@ -404,11 +602,30 @@ install_mtproxy() {
     esac
     println ""
 
+    # Stats endpoint
+    println "${BOLD}Stats endpoint${NC}"
+    println "Publishes MTProxy statistics on localhost. Rarely needed."
+    read -rp "Publish stats port? [y/N]: " _in
+    case "${_in,,}" in
+        y|yes)
+            MTPROXY_STATS=1
+            read -rp "Stats port [${STATS_PORT}]: " _in
+            MTPROXY_STATS_PORT="${_in:-$STATS_PORT}"
+            [[ "$MTPROXY_STATS_PORT" =~ ^[0-9]+$ ]] && (( MTPROXY_STATS_PORT >= 1 && MTPROXY_STATS_PORT <= 65535 )) \
+                || die "Invalid stats port: $MTPROXY_STATS_PORT"
+            ok "Stats: published on 127.0.0.1:${MTPROXY_STATS_PORT}"
+            ;;
+        *)
+            MTPROXY_STATS=0
+            MTPROXY_STATS_PORT=""
+            ok "Stats: not published"
+            ;;
+    esac
+    println ""
+
     # External IP
-    info "Detecting external IP..."
-    EXTERNAL_IP=$(detect_ip)
-    [[ -z "$EXTERNAL_IP" ]] && die "Could not detect external IP. Set EXTERNAL_IP manually and re-run."
-    ok "External IP: $EXTERNAL_IP"
+    println "${BOLD}Server address${NC}"
+    read_external_ip
     println ""
 
     stop_and_remove "$CONTAINER_NAME"
@@ -425,23 +642,25 @@ install_mtproxy() {
     header "Connection"
     print_mtproxy_links
     println "  Logs:  ${CYAN}docker logs -f ${CONTAINER_NAME}${NC}"
-    println "  Re-run this script to manage the proxy."
+    println "  Manage it from the proxy list below (or re-run this script)."
     println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     println ""
 }
 
 install_telemt() {
-    PROXY_TYPE="telemt"
-    IMAGE="$TELEMT_IMAGE"
-    CONTAINER_NAME="$TELEMT_CONTAINER"
+    use_instance telemt
 
     println ""
+    if instance_installed mtproxy; then
+        info "MTProxy is already installed on port $(peek_cfg mtproxy PORT) — Telemt will run alongside it."
+        println ""
+    fi
 
     # Port
     println "${BOLD}Port${NC}"
-    read -rp "Port [443]: " _in
-    PORT="${_in:-443}"
-    [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "Invalid port: $PORT"
+    local default_port=443
+    port_used_by_other_instance 443 telemt && default_port=8443
+    read_port telemt "$default_port"
     ok "Port: $PORT"
     println ""
 
@@ -499,10 +718,8 @@ install_telemt() {
     println ""
 
     # External IP
-    info "Detecting external IP..."
-    EXTERNAL_IP=$(detect_ip)
-    [[ -z "$EXTERNAL_IP" ]] && die "Could not detect external IP."
-    ok "External IP: $EXTERNAL_IP"
+    println "${BOLD}Server address${NC}"
+    read_external_ip
     println ""
 
     # Write users file first, then generate TOML from it
@@ -529,7 +746,7 @@ install_telemt() {
     header "Connection"
     print_telemt_links
     println "  Logs:  ${CYAN}docker logs -f ${CONTAINER_NAME}${NC}"
-    println "  Re-run this script to manage the proxy."
+    println "  Manage it from the proxy list below (or re-run this script)."
     println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     println ""
 }
@@ -576,16 +793,28 @@ action_restart() {
     println ""
 }
 
+# Remove everything belonging to the current instance only — the other
+# instance's container, config, volume and users file must stay untouched.
+wipe_instance() {
+    if [[ "$PROXY_TYPE" == "mtproxy" ]]; then
+        stop_and_remove "$CONTAINER_NAME" true
+    else
+        stop_and_remove "$CONTAINER_NAME"
+        rm -f "$TELEMT_USERS_FILE"
+    fi
+    rm -f "$CONFIG_FILE"
+}
+
+# Returns 0 when the instance was actually removed, 1 when cancelled.
 action_uninstall() {
     println ""
-    warn "This will stop and remove the container and saved config."
+    warn "This will stop and remove the ${PROXY_TYPE} container and its saved config."
     read -rp "Are you sure? [y/N]: " _in
     case "${_in,,}" in
         y|yes) ;;
-        *) info "Uninstall cancelled."; return ;;
+        *) info "Uninstall cancelled."; return 1 ;;
     esac
-    stop_and_remove "$CONTAINER_NAME" true
-    rm -f "$CONFIG_FILE" "$TELEMT_USERS_FILE"
+    wipe_instance
     if [[ "$PROXY_TYPE" == "telemt" ]]; then
         read -rp "Remove telemt config dir (${TELEMT_CONFIG_DIR})? [y/N]: " _in
         case "${_in,,}" in
@@ -595,7 +824,7 @@ action_uninstall() {
     fi
     ok "Uninstalled."
     println ""
-    exit 0
+    return 0
 }
 
 # ── Telemt user management ────────────────────────────────────────────────────
@@ -728,10 +957,17 @@ action_reconfigure() {
     if [[ "$PROXY_TYPE" == "mtproxy" ]]; then
         # ── MTProxy reconfigure ───────────────────────────────────────────────
         println "${BOLD}Port${NC} ${DIM}(current: ${PORT})${NC}"
-        read -rp "Port [${PORT}]: " _in
-        local new_port="${_in:-${PORT}}"
-        [[ "$new_port" =~ ^[0-9]+$ ]] && (( new_port >= 1 && new_port <= 65535 )) \
-            || { warn "Invalid port."; return; }
+        local old_port="$PORT"
+        read_port mtproxy "$PORT"
+        local new_port="$PORT"
+        PORT="$old_port"
+
+        println ""
+        println "${BOLD}Server address${NC} ${DIM}(current: ${EXTERNAL_IP})${NC}"
+        local old_ip="$EXTERNAL_IP"
+        read_external_ip "$EXTERNAL_IP"
+        local new_ip="$EXTERNAL_IP"
+        EXTERNAL_IP="$old_ip"
 
         println ""
         local fake_tls_default="N"; [[ "$FAKE_TLS" == "1" ]] && fake_tls_default="Y"
@@ -755,6 +991,29 @@ action_reconfigure() {
         esac
 
         println ""
+        local stats_cur="not published"; [[ "$MTPROXY_STATS" == "1" ]] && stats_cur="published on 127.0.0.1:${MTPROXY_STATS_PORT}"
+        local stats_default="N"; [[ "$MTPROXY_STATS" == "1" ]] && stats_default="Y"
+        println "${BOLD}Stats endpoint${NC} ${DIM}(current: ${stats_cur})${NC}"
+        read -rp "Publish stats port? [${stats_default}]: " _in
+        local new_stats new_stats_port
+        case "${_in,,}" in
+            n|no) new_stats=0; new_stats_port="" ;;
+            y|yes|"")
+                if [[ "$stats_default" == "N" && -z "$_in" ]]; then
+                    new_stats=0; new_stats_port=""
+                else
+                    new_stats=1
+                    local sp_default="${MTPROXY_STATS_PORT:-$STATS_PORT}"
+                    read -rp "Stats port [${sp_default}]: " _in
+                    new_stats_port="${_in:-$sp_default}"
+                    [[ "$new_stats_port" =~ ^[0-9]+$ ]] && (( new_stats_port >= 1 && new_stats_port <= 65535 )) \
+                        || { warn "Invalid stats port."; return; }
+                fi
+                ;;
+            *) new_stats=0; new_stats_port="" ;;
+        esac
+
+        println ""
         read -rp "Regenerate secret? (links will change) [y/N]: " _in
         case "${_in,,}" in
             y|yes)
@@ -768,8 +1027,9 @@ action_reconfigure() {
             *) new_secret="$SECRET"; ok "Keeping current secret." ;;
         esac
 
-        PORT="$new_port"; FAKE_TLS="$new_fake_tls"
+        PORT="$new_port"; EXTERNAL_IP="$new_ip"; FAKE_TLS="$new_fake_tls"
         FAKE_TLS_DOMAIN="$new_domain"; SECRET="$new_secret"
+        MTPROXY_STATS="$new_stats"; MTPROXY_STATS_PORT="$new_stats_port"
         save_config
         info "Restarting container..."
         stop_and_remove "$CONTAINER_NAME"
@@ -781,10 +1041,17 @@ action_reconfigure() {
     else
         # ── Telemt reconfigure ────────────────────────────────────────────────
         println "${BOLD}Port${NC} ${DIM}(current: ${PORT})${NC}"
-        read -rp "Port [${PORT}]: " _in
-        local new_port="${_in:-${PORT}}"
-        [[ "$new_port" =~ ^[0-9]+$ ]] && (( new_port >= 1 && new_port <= 65535 )) \
-            || { warn "Invalid port."; return; }
+        local old_port="$PORT"
+        read_port telemt "$PORT"
+        local new_port="$PORT"
+        PORT="$old_port"
+
+        println ""
+        println "${BOLD}Server address${NC} ${DIM}(current: ${EXTERNAL_IP})${NC}"
+        local old_ip="$EXTERNAL_IP"
+        read_external_ip "$EXTERNAL_IP"
+        local new_ip="$EXTERNAL_IP"
+        EXTERNAL_IP="$old_ip"
 
         println ""
         println "${BOLD}Fake TLS domain${NC} ${DIM}(current: ${TELEMT_DOMAIN})${NC}"
@@ -814,7 +1081,7 @@ action_reconfigure() {
             *) new_metrics=0; new_metrics_port="" ;;
         esac
 
-        PORT="$new_port"; TELEMT_DOMAIN="$new_domain"
+        PORT="$new_port"; EXTERNAL_IP="$new_ip"; TELEMT_DOMAIN="$new_domain"
         TELEMT_METRICS="$new_metrics"; TELEMT_METRICS_PORT="$new_metrics_port"
         save_config
         regen_telemt_toml "$PORT" "$TELEMT_DOMAIN"
@@ -849,11 +1116,19 @@ menu_users() {
 }
 
 menu_manage() {
+    use_instance "$1"
     load_config
     while true; do
         local st info_line
         st=$(status_icon "$CONTAINER_NAME")
         info_line="${PROXY_TYPE}  |  port ${PORT}"
+        if [[ "$PROXY_TYPE" == "mtproxy" ]]; then
+            if [[ "$MTPROXY_STATS" == "1" ]]; then
+                info_line+="  |  stats 127.0.0.1:${MTPROXY_STATS_PORT}"
+            else
+                info_line+="  |  ${DIM}stats off${NC}"
+            fi
+        fi
         if [[ "$PROXY_TYPE" == "telemt" ]]; then
             if [[ "$TELEMT_METRICS" == "1" ]]; then
                 info_line+="  |  metrics 127.0.0.1:${TELEMT_METRICS_PORT}"
@@ -862,7 +1137,7 @@ menu_manage() {
             fi
         fi
         info_line+="  |  $(echo -e "$st")"
-        header "MTProxy Manager"
+        header "$(type_label "$PROXY_TYPE") — Manage"
         println "  ${info_line}"
         println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         println "  1) Show connection links"
@@ -875,6 +1150,7 @@ menu_manage() {
         println "  6) Restart"
         println "  7) Reinstall    ${DIM}(full reset)${NC}"
         println "  8) Uninstall"
+        println "  b) Back  ${DIM}(proxy list)${NC}"
         println "  q) Quit"
         println ""
         read -rp "Choice: " choice
@@ -899,38 +1175,76 @@ menu_manage() {
             5) action_reconfigure ;;
             6) action_restart ;;
             7)
-                warn "This will stop the container, wipe config and reinstall from scratch."
+                warn "This will stop the ${PROXY_TYPE} container, wipe its config and reinstall from scratch."
                 read -rp "Continue? [y/N]: " _in
                 case "${_in,,}" in
                     y|yes)
-                        stop_and_remove "$CONTAINER_NAME"
-                        rm -f "$CONFIG_FILE" "$TELEMT_USERS_FILE"
-                        menu_install
+                        local t="$PROXY_TYPE"
+                        wipe_instance
+                        install_instance "$t"
                         return
                         ;;
                     *) ;;
                 esac
                 ;;
-            8) action_uninstall ;;
+            8) if action_uninstall; then return; fi ;;
+            b|B) return ;;
             q|Q) exit 0 ;;
             *) warn "Unknown option." ;;
         esac
     done
 }
 
-menu_install() {
-    header "MTProxy Installer"
-    println "  1) Official MTProxy  ${DIM}(imilya/mtproxy — battle-tested, single secret)${NC}"
-    println "  2) Telemt            ${DIM}(Rust, Fake TLS, multi-user, hot reload)${NC}"
-    println "  q) Quit"
-    println ""
-    read -rp "Choice: " choice
-    case "$choice" in
-        1) install_mtproxy ;;
-        2) install_telemt ;;
-        q|Q) exit 0 ;;
-        *) warn "Unknown option."; menu_install ;;
+install_instance() {
+    case "$1" in
+        mtproxy) install_mtproxy ;;
+        telemt)  install_telemt ;;
     esac
+}
+
+# One line per instance slot: settings + container state, or "not installed".
+instance_summary() {
+    local t="$1"
+    if ! instance_installed "$t"; then
+        echo "${DIM}not installed${NC}"
+        return
+    fi
+    local extra=""
+    if [[ "$t" == "telemt" ]]; then
+        extra="  |  domain $(peek_cfg telemt TELEMT_DOMAIN)"
+    elif [[ "$(peek_cfg mtproxy FAKE_TLS)" == "1" ]]; then
+        extra="  |  domain $(peek_cfg mtproxy FAKE_TLS_DOMAIN)"
+    fi
+    echo "port $(peek_cfg "$t" PORT)${extra}  |  $(status_icon "$(container_for "$t")")"
+}
+
+menu_main() {
+    while true; do
+        header "MTProxy Installer"
+        println "  ${DIM}Both proxies can run side by side on different ports.${NC}"
+        println ""
+        println "  1) Official MTProxy  ${DIM}(imilya/mtproxy — battle-tested, single secret)${NC}"
+        println "     $(instance_summary mtproxy)"
+        println "  2) Telemt            ${DIM}(Rust, Fake TLS, multi-user, hot reload)${NC}"
+        println "     $(instance_summary telemt)"
+        println "  q) Quit"
+        println ""
+        println "  ${DIM}Pick an installed proxy to manage it, or a free slot to install it.${NC}"
+        println ""
+        read -rp "Choice: " choice
+        local t=""
+        case "$choice" in
+            1) t="mtproxy" ;;
+            2) t="telemt" ;;
+            q|Q) exit 0 ;;
+            *) warn "Unknown option."; continue ;;
+        esac
+        if instance_installed "$t"; then
+            menu_manage "$t"
+        else
+            install_instance "$t"
+        fi
+    done
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -939,10 +1253,11 @@ menu_install() {
 
 command -v docker &>/dev/null || die "Docker is required but not installed."
 
-if config_exists; then
-    menu_manage
-else
+migrate_legacy_config
+
+if ! any_instance_installed; then
     ok "Docker found"
     println ""
-    menu_install
 fi
+
+menu_main
