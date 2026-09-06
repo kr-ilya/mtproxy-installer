@@ -133,6 +133,7 @@ save_config() {
     chmod 600 "$CONFIG_FILE"
     cfg_set PROXY_TYPE    "$PROXY_TYPE"
     cfg_set PORT          "$PORT"
+    cfg_set PUBLIC_HOST   "$PUBLIC_HOST"
     cfg_set EXTERNAL_IP   "$EXTERNAL_IP"
     cfg_set IMAGE         "$IMAGE"
     cfg_set CONTAINER_NAME "$CONTAINER_NAME"
@@ -157,6 +158,7 @@ load_config() {
     PROXY_TYPE=$(cfg_get PROXY_TYPE)
     [[ -n "$PROXY_TYPE" ]] || PROXY_TYPE="$fallback_type"
     PORT=$(cfg_get PORT)
+    PUBLIC_HOST=$(cfg_get PUBLIC_HOST)
     EXTERNAL_IP=$(cfg_get EXTERNAL_IP)
     IMAGE=$(cfg_get IMAGE)
     CONTAINER_NAME=$(cfg_get CONTAINER_NAME)
@@ -172,6 +174,11 @@ load_config() {
     TELEMT_METRICS_PORT=$(cfg_get TELEMT_METRICS_PORT)
     # Recompute derived values / repair configs written by older versions
     TELEMT_API="http://127.0.0.1:${TELEMT_API_PORT}"
+    # Older configs had a single EXTERNAL_IP that was also the link address.
+    [[ -n "$PUBLIC_HOST" ]] || PUBLIC_HOST="$EXTERNAL_IP"
+    # A loopback address is a valid link address but never a valid nat-info
+    # value: MTProxy would announce 127.0.0.1 to Telegram and reconnect forever.
+    is_loopback_host "$EXTERNAL_IP" && EXTERNAL_IP=""
     # Configs written before the stats port became optional always published it.
     [[ "$PROXY_TYPE" == "mtproxy" && -z "$MTPROXY_STATS" ]] && MTPROXY_STATS=1
     MTPROXY_STATS_PORT="${MTPROXY_STATS_PORT:-$STATS_PORT}"
@@ -262,28 +269,40 @@ valid_host() {
     [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]
 }
 
-# Detect the external IP, then let the user confirm or override it —
-# e.g. 127.0.0.1 for a local test install, or a domain name. Sets EXTERNAL_IP.
-read_external_ip() {
+is_loopback_host() {
+    [[ "$1" == "localhost" || "$1" =~ ^127\. ]]
+}
+
+# Two distinct addresses, deliberately kept apart:
+#   EXTERNAL_IP  — the real public IP of the host. MTProxy gets it as
+#                  --nat-info <container_ip>:<EXTERNAL_IP> to announce itself to
+#                  Telegram. A loopback value here makes it announce 127.0.0.1
+#                  and reconnect to the middle proxies in a loop, so it is only
+#                  ever auto-detected, never taken from user input.
+#   PUBLIC_HOST  — the address clients connect to. Used for tg:// links and for
+#                  deciding whether to publish the port on loopback only.
+# They differ for local installs (127.0.0.1), domains and NAT setups.
+read_server_address() {
     local current="${1:-}" detected=""
-    if [[ -z "$current" ]]; then
-        info "Detecting external IP..."
-        detected=$(detect_ip)
-        if [[ -n "$detected" ]]; then
-            ok "Detected: ${detected}"
-        else
-            warn "Could not detect the external IP automatically — enter it manually."
-        fi
+    info "Detecting external IP..."
+    detected=$(detect_ip)
+    if [[ -n "$detected" ]]; then
+        EXTERNAL_IP="$detected"
+        ok "Detected: ${detected}"
+    else
+        EXTERNAL_IP=""
+        warn "Could not detect the external IP — the container will detect it itself."
     fi
     local default="${current:-${detected:-127.0.0.1}}"
-    println "${DIM}Used in connection links. Enter 127.0.0.1 for a local install${NC}"
-    println "${DIM}— the port is then published on loopback only.${NC}"
+    println "${DIM}Address clients connect to — used in connection links.${NC}"
+    println "${DIM}Enter 127.0.0.1 for a local install: the port is then published${NC}"
+    println "${DIM}on loopback only, while Telegram still sees the real IP.${NC}"
     while true; do
         read -rp "Server address [${default}]: " _in
         local host="${_in:-$default}"
         if valid_host "$host"; then
-            EXTERNAL_IP="$host"
-            ok "Server address: $EXTERNAL_IP"
+            PUBLIC_HOST="$host"
+            ok "Server address: $PUBLIC_HOST"
             return
         fi
         warn "Invalid address: ${host}"
@@ -434,8 +453,8 @@ telemt_dd_link() {
 print_user_links() {
     local name="$1" secret="$2"
     local ee dd
-    ee=$(telemt_ee_link "$EXTERNAL_IP" "$PORT" "$TELEMT_DOMAIN" "$secret")
-    dd=$(telemt_dd_link "$EXTERNAL_IP" "$PORT" "$secret")
+    ee=$(telemt_ee_link "$PUBLIC_HOST" "$PORT" "$TELEMT_DOMAIN" "$secret")
+    dd=$(telemt_dd_link "$PUBLIC_HOST" "$PORT" "$secret")
     println "  ${BOLD}${name}${NC}"
     println "  ${DIM}EE (Fake TLS):${NC} ${GREEN}${ee}${NC}"
     println "  ${DIM}DD (Secure):${NC}   ${GREEN}${dd}${NC}"
@@ -443,34 +462,38 @@ print_user_links() {
 }
 
 # ── Docker run helpers ────────────────────────────────────────────────────────
-# A local install (127.x.x.x / localhost) is only reachable from this machine,
+# A local install (PUBLIC_HOST on loopback) is only reachable from this machine,
 # so the proxy port is published on the loopback interface instead of 0.0.0.0.
-is_local_install() {
-    [[ "$EXTERNAL_IP" == "localhost" || "$EXTERNAL_IP" =~ ^127\. ]]
-}
+is_local_install() { is_loopback_host "$PUBLIC_HOST"; }
 
 publish_addr() {
     if is_local_install; then echo "127.0.0.1:"; else echo ""; fi
 }
 
 run_mtproxy() {
-    local bind stats_ports=()
+    local bind stats_ports=() nat_env=()
     bind=$(publish_addr)
     # The stats endpoint lives inside the container either way; publishing it
     # on the host is opt-in so it does not occupy a port for nothing.
     if [[ "$MTPROXY_STATS" == "1" ]]; then
         stats_ports+=(-p "127.0.0.1:${MTPROXY_STATS_PORT}:${STATS_PORT}/tcp")
     fi
+    # Only pass a real public IP for --nat-info; if detection failed, let the
+    # image detect it from inside the container instead of announcing garbage.
+    if [[ -n "$EXTERNAL_IP" ]]; then
+        nat_env+=(-e EXTERNAL_IP="${EXTERNAL_IP}")
+    fi
+    # MTProxy is TCP-only — no UDP mapping.
     docker run -d \
         --name "${CONTAINER_NAME}" \
         --restart unless-stopped \
         -p "${bind}${PORT}:${PORT}/tcp" \
-        -p "${bind}${PORT}:${PORT}/udp" \
         "${stats_ports[@]}" \
         -e PORT="${PORT}" \
         -e STATS_PORT="${STATS_PORT}" \
         -e SECRET="${SECRET}" \
-        -e EXTERNAL_IP="${EXTERNAL_IP}" \
+        "${nat_env[@]}" \
+        -e PUBLIC_HOST="${PUBLIC_HOST}" \
         -e FAKE_TLS="${FAKE_TLS}" \
         -e FAKE_TLS_DOMAIN="${FAKE_TLS_DOMAIN}" \
         -v mtproxy-data:/data \
@@ -510,7 +533,7 @@ print_local_bind_note() {
 
 print_mtproxy_links() {
     println ""
-    println "  ${BOLD}Server:${NC}  ${EXTERNAL_IP}:${PORT}"
+    println "  ${BOLD}Server:${NC}  ${PUBLIC_HOST}:${PORT}"
     [[ "$FAKE_TLS" == "1" ]] && println "  ${BOLD}Domain:${NC}  ${FAKE_TLS_DOMAIN}"
     print_local_bind_note
     println ""
@@ -518,17 +541,17 @@ print_mtproxy_links() {
     base=$(mtproxy_base_secret "$SECRET")
     println "  ${BOLD}Connection links:${NC}"
     if [[ "$FAKE_TLS" == "1" ]]; then
-        println "  ${DIM}EE (Fake TLS):${NC} ${GREEN}tg://proxy?server=${EXTERNAL_IP}&port=${PORT}&secret=${SECRET}${NC}"
+        println "  ${DIM}EE (Fake TLS):${NC} ${GREEN}tg://proxy?server=${PUBLIC_HOST}&port=${PORT}&secret=${SECRET}${NC}"
     fi
-    println "  ${DIM}DD (Secure):${NC}   ${GREEN}tg://proxy?server=${EXTERNAL_IP}&port=${PORT}&secret=dd${base}${NC}"
+    println "  ${DIM}DD (Secure):${NC}   ${GREEN}tg://proxy?server=${PUBLIC_HOST}&port=${PORT}&secret=dd${base}${NC}"
     println "  ${DIM}Plain (no obfuscation):${NC}"
-    println "  ${GREEN}tg://proxy?server=${EXTERNAL_IP}&port=${PORT}&secret=${base}${NC}"
+    println "  ${GREEN}tg://proxy?server=${PUBLIC_HOST}&port=${PORT}&secret=${base}${NC}"
     println ""
 }
 
 print_telemt_links() {
     println ""
-    println "  ${BOLD}Server:${NC}  ${EXTERNAL_IP}:${PORT}  (domain: ${TELEMT_DOMAIN})"
+    println "  ${BOLD}Server:${NC}  ${PUBLIC_HOST}:${PORT}  (domain: ${TELEMT_DOMAIN})"
     print_local_bind_note
     println ""
     if ! users_file_exists || [[ "$(users_count)" -eq 0 ]]; then
@@ -623,9 +646,9 @@ install_mtproxy() {
     esac
     println ""
 
-    # External IP
+    # Server address
     println "${BOLD}Server address${NC}"
-    read_external_ip
+    read_server_address
     println ""
 
     stop_and_remove "$CONTAINER_NAME"
@@ -717,9 +740,9 @@ install_telemt() {
     ok "User: ${first_user}  secret: ${first_secret}"
     println ""
 
-    # External IP
+    # Server address
     println "${BOLD}Server address${NC}"
-    read_external_ip
+    read_server_address
     println ""
 
     # Write users file first, then generate TOML from it
@@ -963,11 +986,11 @@ action_reconfigure() {
         PORT="$old_port"
 
         println ""
-        println "${BOLD}Server address${NC} ${DIM}(current: ${EXTERNAL_IP})${NC}"
-        local old_ip="$EXTERNAL_IP"
-        read_external_ip "$EXTERNAL_IP"
-        local new_ip="$EXTERNAL_IP"
-        EXTERNAL_IP="$old_ip"
+        println "${BOLD}Server address${NC} ${DIM}(current: ${PUBLIC_HOST})${NC}"
+        local old_host="$PUBLIC_HOST" old_ip="$EXTERNAL_IP"
+        read_server_address "$PUBLIC_HOST"
+        local new_host="$PUBLIC_HOST" new_ip="$EXTERNAL_IP"
+        PUBLIC_HOST="$old_host"; EXTERNAL_IP="$old_ip"
 
         println ""
         local fake_tls_default="N"; [[ "$FAKE_TLS" == "1" ]] && fake_tls_default="Y"
@@ -1027,7 +1050,7 @@ action_reconfigure() {
             *) new_secret="$SECRET"; ok "Keeping current secret." ;;
         esac
 
-        PORT="$new_port"; EXTERNAL_IP="$new_ip"; FAKE_TLS="$new_fake_tls"
+        PORT="$new_port"; PUBLIC_HOST="$new_host"; EXTERNAL_IP="$new_ip"; FAKE_TLS="$new_fake_tls"
         FAKE_TLS_DOMAIN="$new_domain"; SECRET="$new_secret"
         MTPROXY_STATS="$new_stats"; MTPROXY_STATS_PORT="$new_stats_port"
         save_config
@@ -1047,11 +1070,11 @@ action_reconfigure() {
         PORT="$old_port"
 
         println ""
-        println "${BOLD}Server address${NC} ${DIM}(current: ${EXTERNAL_IP})${NC}"
-        local old_ip="$EXTERNAL_IP"
-        read_external_ip "$EXTERNAL_IP"
-        local new_ip="$EXTERNAL_IP"
-        EXTERNAL_IP="$old_ip"
+        println "${BOLD}Server address${NC} ${DIM}(current: ${PUBLIC_HOST})${NC}"
+        local old_host="$PUBLIC_HOST" old_ip="$EXTERNAL_IP"
+        read_server_address "$PUBLIC_HOST"
+        local new_host="$PUBLIC_HOST" new_ip="$EXTERNAL_IP"
+        PUBLIC_HOST="$old_host"; EXTERNAL_IP="$old_ip"
 
         println ""
         println "${BOLD}Fake TLS domain${NC} ${DIM}(current: ${TELEMT_DOMAIN})${NC}"
@@ -1081,7 +1104,7 @@ action_reconfigure() {
             *) new_metrics=0; new_metrics_port="" ;;
         esac
 
-        PORT="$new_port"; EXTERNAL_IP="$new_ip"; TELEMT_DOMAIN="$new_domain"
+        PORT="$new_port"; PUBLIC_HOST="$new_host"; EXTERNAL_IP="$new_ip"; TELEMT_DOMAIN="$new_domain"
         TELEMT_METRICS="$new_metrics"; TELEMT_METRICS_PORT="$new_metrics_port"
         save_config
         regen_telemt_toml "$PORT" "$TELEMT_DOMAIN"
